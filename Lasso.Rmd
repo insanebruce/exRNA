@@ -1,0 +1,560 @@
+---
+title: "Jasen Lasso"
+author: "Jasen Zhang"
+date: "5/30/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(glmnet)
+library(pROC)
+library(logistf)
+```
+
+# Get the data
+
+```{r}
+anno <- read.delim('mart_export.txt')
+
+
+zz=gzfile('GSE131512_cancerTPM.txt.gz','rt')  
+dat=read.csv(zz,header=T, sep = '\t')
+dat2 <- as.data.frame(t(dat))
+
+demo <- as.data.frame(read_excel('GSE131512_metaData.xlsx'))
+
+
+```
+
+#save outcomes - no need to do this anymore
+
+```{r}
+subject_names <- colnames(dat)
+
+outcomes <- c(rep(1, 28), rep(0, 68))
+
+outcome_df <- data.frame(subject_names, outcomes)
+
+write.csv(outcome_df, 'outcome.csv')
+
+```
+
+# load outcomes
+
+```{r}
+outcome <- read.csv('outcome.csv')
+rownames(outcome) <- outcome$subject_names
+outcome$outcomes <- as.factor(outcome$outcomes)
+
+outcome_table <- as.data.frame(table(outcome$outcomes))
+
+g_outcome <- ggplot() + 
+  geom_bar(aes(x = outcome$outcomes)) + 
+  geom_text(data = outcome_table, aes(x = Var1, y = Freq, label = Freq), vjust = -0.5) + 
+  xlab('Breast Cancer Recurrence') + 
+  ylab('Count')
+
+train_ID <- c(0,  2,  4,  5,  6,  7,  8, 10, 12, 14, 15, 16, 18, 19, 20, 21, 22,
+       23, 24, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 39, 40, 41, 43,
+       44, 45, 47, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 64, 65, 68,
+       69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 81, 82, 83, 84, 86, 89, 91,
+       92, 93, 94, 95) + 1
+
+test_ID <- setdiff(1:nrow(outcome), train_ID)
+```
+
+# Checking how many zeros are in the data
+
+```{r}
+how_many_zeros <- apply(dat2, 2, function(x){sum(x == 0)})
+
+g_zeros <- ggplot() + 
+  geom_histogram(aes(x = how_many_zeros/nrow(outcome)), bins = 96) + 
+  xlab('Percent Missing') + 
+  ylab('Count')
+
+table(how_many_zeros)
+
+g_zeros
+```
+
+# assigning labels to each of the genes
+
+```{r}
+anno2 <- anno[!duplicated(anno$Gene.stable.ID),]
+dat_temp <- dat %>% mutate(Gene.stable.ID = rownames(dat))
+
+dat_anno <- dat_temp %>% inner_join(anno2, by = "Gene.stable.ID")
+
+dat_anno2 <- sort(table(dat_anno$Gene.type))
+
+dat_anno3 <- data.frame(dat_anno2, names(dat_anno2))
+
+g_anno <- ggplot(data = dat_anno3, aes(x = reorder(Var1, (-Freq)), y = Freq)) + 
+  geom_bar(stat = 'identity') + 
+  theme(axis.text.x = element_text(angle = 90)) + 
+  xlab('Gene Type') + 
+  ylab('Count')
+
+g_anno
+```
+
+
+
+# Creating new datasets based on filtering out zeros
+
+```{r}
+num_zeros <- c()
+for(i in 1:nrow(dat_anno)){
+  slice <- unlist(unname(dat_anno[i,]))
+  temp <- sum(slice == 0)
+  num_zeros <- append(num_zeros, temp)
+}
+
+patient_names <- paste(rep('C',96), as.character(seq(1,96)), sep = '')
+
+dat_anno$num_zeros <- num_zeros
+
+dat3 <- dat_anno %>% filter(num_zeros <= 5)
+
+dat_anno4 <- sort(table(dat3$Gene.type))
+
+dat_anno5 <- data.frame(dat_anno4, names(dat_anno4))
+
+g_anno2 <- ggplot(data = dat_anno5, aes(x = reorder(Var1, (-Freq)), y = Freq)) + 
+  geom_bar(stat = 'identity') + 
+  theme(axis.text.x = element_text(angle = 90)) + 
+  xlab('Gene Type') + 
+  ylab('Count')
+
+dat3_pc <- dat_anno %>% filter(num_zeros <= 5) %>% filter(Gene.type == 'protein_coding')
+temp <- dat3_pc$Gene.stable.ID
+dat3_pc <- dat3_pc %>% select(patient_names) %>% t() %>% as.data.frame()
+colnames(dat3_pc) <- temp
+  
+  
+dat3_lnc <- dat_anno %>% filter(num_zeros <= 5) %>% filter(Gene.type == 'lncRNA')
+dat3_both <- dat_anno %>% filter(num_zeros <= 5) %>% filter(Gene.type == 'lncRNA' | Gene.type == 'protein_coding')
+
+get_data <- function(dat_anno, missing){
+  dat3 <- dat_anno %>% filter(num_zeros <= missing) %>% filter(Gene.type == 'protein_coding' | Gene.type == 'lncRNA')
+  temp <- dat3$Gene.stable.ID
+  dat3 <- dat3 %>% select(patient_names) %>% t() %>% as.data.frame()
+  colnames(dat3) <- temp
+  
+  dat3
+}
+
+dat3 <- get_data(dat_anno, 5)
+dat4 <- get_data(dat_anno, 0)
+dat5 <- get_data(dat_anno, 10)
+dat6 <- get_data(dat_anno, 20)
+
+# dat4 <- dat2[, how_many_zeros <= 10]
+# dat5 <- dat2[, how_many_zeros <= 20]
+# dat6 <- dat2[, how_many_zeros <= 90]
+```
+
+
+
+
+# See if the data is normally distributed
+
+```{r}
+norm_pvals <- c()
+log_norm_pvals <- c()
+for(i in 1:length(dat3_pc)){
+  temp <- dat3_pc[,i]
+  temp <- temp[!temp == 0]
+  
+  pval <- shapiro.test(temp)$p.value
+  norm_pvals <- append(norm_pvals, pval)
+  
+  log_pval <- shapiro.test(log(temp))$p.value
+  log_norm_pvals <- append(log_norm_pvals, log_pval)
+}
+
+g_normal <- ggplot() + 
+  geom_histogram(aes(x = norm_pvals), color = 'blue', fill = 'blue', alpha = 0.1) + 
+  geom_histogram(aes(x = log_norm_pvals), color = 'orange', fill = 'orange', alpha = 0.1)
+```
+
+# Perform Lasso on the 750 preselected genes:
+
+```{r}
+genes_750 <- read.delim('preselectedList_750.txt', header = FALSE)
+
+genes_750 <- dplyr::pull(genes_750, V1)
+
+df1 <- dat[rownames(dat) %in% genes_750,]
+
+df1.1 <- as.data.frame(t(df1))
+
+
+df1.2 <-  df1.1 %>% mutate(subject_names = rownames(df1.1))
+
+df1.3 <- df1.2 %>% full_join(outcome, by = 'subject_names')
+
+# get train and test set ID
+
+train_df <- df1.3[train_ID,]
+test_df <- df1.3[test_ID,]
+
+x_train <- as.matrix(df1.1[train_ID,])
+x_test <- as.matrix(df1.1[test_ID,])
+
+y_train <- as.matrix(df1.3[train_ID,] %>% select(outcomes))
+y_test <- as.matrix(df1.3[test_ID,] %>% select(outcomes))
+
+# Cross Validation
+
+lambdas <- 10^seq(-2, 2, by = 0.1)
+
+lasso_model <- cv.glmnet(x_train, y_train, family = 'binomial', alpha = 1, lambda = lambdas)
+
+```
+
+# Perform Lasso on all genes available
+
+```{r}
+x_train <- as.matrix(dat2[train_ID,])
+x_test <- as.matrix(dat2[test_ID,])
+
+y_train <- as.matrix(df1.3[train_ID,] %>% select(outcomes))
+y_test <- as.matrix(df1.3[test_ID,] %>% select(outcomes))
+
+lambdas <- 10^seq(-2, 2, by = 0.1)
+lasso_model <- cv.glmnet(x_train, y_train, family = 'binomial', alpha = 0.1, lambda = lambdas)
+
+lasso_model2 <- glmnet(x_train, y_train, family = 'binomial', alpha = 1, lambda =  lasso_model$lambda.min)
+
+y_hat <- predict(lasso_model2, s = lasso_model$lambda.min, newx = x_test)
+  
+
+
+
+m1 <- perform_lasso(dat2, df1.3)
+
+y_hat <- predict(m1, s = las)
+```
+
+# Perform Lasso on genes that have 5 or less zeros
+
+```{r}
+x_train <- as.matrix(dat3[train_ID,])
+x_test <- as.matrix(dat3[test_ID,])
+
+y_train <- as.matrix(df1.3[train_ID,] %>% select(outcomes))
+y_test <- as.matrix(df1.3[test_ID,] %>% select(outcomes))
+
+lambdas <- 10^seq(-2, 2, by = 0.1)
+lasso_model <- cv.glmnet(x_train, y_train, family = 'binomial', alpha = 0.05, lambda = lambdas)
+lasso_model
+lasso_model2 <- glmnet(x_train, y_train, family = 'binomial', alpha = 1, lambda =  lasso_model$lambda.min)
+
+y_hat <- predict(lasso_model2, s = lasso_model$lambda.min, newx = x_test)
+  
+
+
+
+m1 <- perform_lasso(dat2, df1.3)
+
+y_hat <- predict(m1, s = las)
+```
+
+# Selecting most differentially expressed genes
+
+```{r}
+num_missing <- c(0,5,10,20)
+for(j in num_missing){
+  if(j == 0){
+    df <- dat4
+  }
+  if(j == 5){
+    df = dat3
+  }
+  if(j == 10){
+    df = dat5
+  }
+  if(j == 20){
+    df= dat6
+  }
+
+
+  pvalues <- c()
+  diffs <- c()
+  obs <- outcome$outcomes
+  for(i in 1:length(df)){
+    expression_slice <- unname(df[,i])
+    
+    expression_1 <- unlist(expression_slice[obs == 1])
+    expression_2 <- unlist(expression_slice[obs == 0])
+    
+    expression_1 <- expression_1[! c(expression_1 == 0)]
+    expression_2 <- expression_2[! c(expression_2 == 0)]
+    
+    pval <- wilcox.test(expression_1, expression_2)$p.value
+    
+    pvalues <- append(pvalues, pval)
+    
+    diff <- mean(expression_1) - mean(expression_2)
+    diffs <- append(diffs, diff)
+  }
+  
+  exploratory_df <- data.frame(pvalues, diffs)
+  
+  exploratory_df$index <- 1:nrow(exploratory_df)
+  
+  exploratory_df$Gene_ID <- colnames(df)
+  
+  g2 <- ggplot(data = exploratory_df) + 
+    geom_point(aes(x = diffs, y = -log(pvalues))) + 
+    xlim(-25,25) + 
+    xlab('Difference between Sample Means') + 
+    ylab('-log10(P-value)')
+  
+  bh_thresholds <- 0.05 / nrow(exploratory_df)
+  
+  sorted_exploratory_df <- exploratory_df %>% arrange(pvalues) %>% mutate(bh = bh_thresholds) %>%
+    mutate(significant = pvalues < 0.05)
+  
+  file_name <- paste('p_values_of_pc_and_lncrna_genes_', as.character(j), sep = '')
+  file_name <- paste(file_name, '_or_less_zeros.csv', sep = '')
+  
+  write.csv(sorted_exploratory_df, file = file_name)
+}
+
+pvalue_graph <- ggplot(data = sorted_exploratory_df) + 
+  geom_point(aes(x = 1:nrow(exploratory_df)/ nrow(exploratory_df), y = pvalues))
+
+#take the top 10 genes
+
+AICs <- c()
+
+set.seed(100)
+train_ID <- sample(1:nrow(outcome), ceiling(nrow(outcome) * 0.75), replace = F)
+test_ID <- setdiff(1:nrow(outcome), train_ID)
+
+for(i in 2:13){
+
+  sig_ID <- sorted_exploratory_df$index[1:i]
+  
+  dat3_sig <- dat3_pc[,sig_ID]
+
+  
+  x_train <- dat3_sig[train_ID,]
+  x_test <- dat3_sig[test_ID,]
+  
+  y_train <- outcome[train_ID,] %>% select(outcomes)
+  y_test <- outcome[test_ID,] %>% select(outcomes)
+  
+  train_df <- cbind(x_train, y_train)
+  test_df <- cbind(x_test, y_test)
+  
+  genes <- colnames(train_df)
+  genes <- genes[! genes == 'outcomes']
+  
+  eq <- paste(genes,sep = '', collapse = ' + ')
+  
+  eq <- paste('outcomes', eq, sep = ' ~ ')
+  
+  lm1 <- glm(eq, family = 'binomial', data = train_df)
+
+  AICs <- append(AICs, AIC(lm1))
+  
+  s1 <- summary(lm1)
+}
+
+df_AIC <- data.frame(2:13, AICs)
+colnames(df_AIC) <- c('num_genes', 'AIC')
+
+g_AIC <- ggplot() + 
+  geom_point(data = df_AIC, aes(x = num_genes, y = AIC)) + 
+  geom_line(data = df_AIC, aes(x = num_genes, y = AIC)) + 
+  xlab('Number of Genes') + 
+  ylab('AIC')
+
+for(i in 10){
+
+  sig_ID <- sorted_exploratory_df$index[1:i]
+  
+  dat3_sig <- dat3_pc[,sig_ID]
+
+  
+  x_train <- dat3_sig[train_ID,]
+  x_test <- dat3_sig[test_ID,]
+  
+  y_train <- outcome[train_ID,] %>% select(outcomes)
+  y_test <- outcome[test_ID,] %>% select(outcomes)
+  
+  train_df <- cbind(x_train, y_train)
+  test_df <- cbind(x_test, y_test)
+  
+  genes <- colnames(train_df)
+  genes <- genes[! genes == 'outcomes']
+  
+  eq <- paste(genes,sep = '', collapse = ' + ')
+  
+  eq <- paste('outcomes', eq, sep = ' ~ ')
+  
+  lm1 <- glm(eq, family = 'binomial', data = train_df)
+
+  AICs <- append(AICs, AIC(lm1))
+  
+  s1 <- summary(lm1)
+}
+
+
+
+y_hat <- exp(predict(lm1, test_df)) / (1 + exp(predict(lm1, test_df)))
+
+roc_graph <- roc(test_df$outcomes, y_hat)
+
+plot(roc_graph)
+```
+
+# Getting the genes of the important datasets
+
+```{r}
+genes_750 <- read.delim('preselectedList_750.txt', header = FALSE)
+
+genes_750 <- dplyr::pull(genes_750, V1)
+
+gene_names_750 <- c()
+
+for(i in genes_750){
+  index <- match(i, anno2$Gene.stable.ID)
+  
+  gene_name <- anno2$Gene.name[index]
+  gene_names_750 <- append(gene_names_750, gene_name)
+}
+
+df_750 <- data.frame(genes_750, gene_names_750)
+colnames(df_750) <- c('Ensembl_ID', 'Gene_Name')
+
+panel_names <- c('PAM50', 'OncotypeDX', 'BreastOncPx', 'HTICS', 'eXagenBC', 'Mammostrat', 'ProExBr', 'MapQuantDx')
+
+panels <- c('UBE2T, BIRC5, NUF2, CDC6, CCNB1, TYMS, MYBL2, CEP55, MELK, 
+NDC80, RRM2, UBE2C, CENPF, PTTG1, EXO1, ORC6L, ANLN, CCNE1,
+CDC20, MKI67, KIF2C, ACTR3B, MYC, EGFR, KRT5, PHGDH, CDH3, MIA,
+KRT17, FOXC1, SFRP1, KRT14, ESR1, SLC39A6, BAG1, MAPT, PGR,
+CXXC5, MLPH, BCL2, MDM2, NAT1, FOXA1, BLVRA, MMP11, GPR160,
+FGFR4, GRB7, TMEM45B, ERBB2',
+'BAG1, BCL2, CCNB1, CD68, SCUBE2, CTSL2, ESR1, GRB7, GSTM1,
+ERBB2,
+MKI67, MYBL2, PGR, AURKA, MMP11, BIRC5, ACTB, GAPDH, GUSB,
+RPLP0, TFRC',
+'BUB1, CCNB1, CENPA, DC13, DIAPH3, MELK, MYBL2, ORC6L, PKMYT1,
+PRR11, RACGAP1, RFC4, TK1, UBE2S',
+'AURKB, CCNA2, SCRN1, NPY, ATP7B, CHAF1B, CCNB1, CLDN8, NRP1,
+CCR2, C1QB, CD74, VCAM1, CD180, ITGB2, CD72, ST8SIA4',
+'CYP2D6, CYP24, PDCD6IP, BIRC5, NR1D1, SMARCE1',
+'TP53, NDRG1, CEACAM5, SLC7A2, SLC7A5, TRMT2A',
+'E2F1, RASA1, PSMB1',
+'UBE2C, KPNA2, TPX2, FOXM1, STK6, CCNA2, BIRC5, MYBL2')
+
+
+
+
+retrieve_ensembl_ID <- function(temp){
+
+  
+  temp1 <- str_replace_all(temp, '\n', ' ')
+  
+  temp2 <- unlist(strsplit(temp1, ', '))
+  
+  temp3 <- df_750 %>% filter(Gene_Name %in% temp2)
+  
+  temp4 <- dplyr::pull(temp3, Ensembl_ID)
+  temp4
+}
+
+
+```
+
+# Performing Logistic Regression on these gene panels
+
+```{r}
+graphs <- list()
+graph_index <- 1
+
+sens_spec_dataframes <- list()
+
+for(temp in 1:length(panels)){
+  panel_name <- panel_names[temp]
+  panel_genes <- retrieve_ensembl_ID(panels[temp])
+  
+  dat3_model <- dat2[, colnames(dat2) %in% panel_genes]
+  
+  print(length(panel_genes))
+  print(sum(colnames(dat2) %in% panel_genes))
+  
+  print(apply(dat3_model,2, function(x){sum(x == 0)}))
+  
+  x_train <- dat3_model[train_ID,]
+  x_test <- dat3_model[test_ID,]
+  
+  y_train <- as.data.frame(outcome$outcomes[train_ID])
+  colnames(y_train) <- c('outcomes')
+  
+  y_test <- as.data.frame(outcome$outcomes[test_ID])
+  colnames(y_test) <- c('outcomes')
+  train_df <- cbind(x_train, y_train)
+  test_df <- cbind(x_test, y_test)
+  
+  genes <- colnames(train_df)
+  genes <- genes[! genes == 'outcomes']
+  
+  eq <- paste(genes,sep = '', collapse = ' + ')
+  
+  eq <- paste('outcomes', eq, sep = ' ~ ')
+  
+  lm1 <- glm(eq, family = 'binomial', data = train_df)
+  s1 <- summary(lm1)
+  
+  y_hat <- exp(predict(lm1, test_df)) / (1 + exp(predict(lm1, test_df)))
+  
+  roc_graph <- roc(test_df$outcomes, y_hat)
+  
+  sens <- roc_graph$sensitivities
+  spec <- 1-  roc_graph$specificities
+  
+  roc_df <- data.frame(sens, spec)
+  roc_df2 <- roc_df[seq(nrow(roc_df),1),]
+  
+  colnames(roc_df2) <- paste(c('sens', 'spec'))
+  
+  sens_spec_dataframes[[graph_index]] <- roc_df2
+  
+  
+  graphs[[graph_index]] <- roc_graph
+  graph_index <- graph_index + 1
+
+  print(roc_graph$auc)
+  
+  plot(roc_graph)
+}
+```
+
+
+```{r}
+
+g_roc <- ggplot() + 
+  geom_line(data = sens_spec_dataframes[[1]], aes(x = spec, y = sens, color = panel_names[1])) + 
+  geom_line(data = sens_spec_dataframes[[2]], aes(x = spec, y = sens, color = panel_names[2])) + 
+  geom_line(data = sens_spec_dataframes[[3]], aes(x = spec, y = sens, color = panel_names[3])) + 
+  geom_line(data = sens_spec_dataframes[[4]], aes(x = spec, y = sens, color = panel_names[4])) + 
+  geom_line(data = sens_spec_dataframes[[5]], aes(x = spec, y = sens, color = panel_names[5])) + 
+  geom_line(data = sens_spec_dataframes[[6]], aes(x = spec, y = sens, color = panel_names[6])) + 
+  geom_line(data = sens_spec_dataframes[[7]], aes(x = spec, y = sens, color = panel_names[7])) + 
+  geom_line(data = sens_spec_dataframes[[8]], aes(x = spec, y = sens, color = panel_names[8]))
+```
+
+
+
